@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
+from types import MappingProxyType
 from typing import Any, Generic, Literal, cast
 
 import anyio
@@ -261,6 +262,21 @@ def _plan_outbound(related_request_id: RequestId | None, opts: CallOptions | Non
     return _OutboundPlan(None, cancel_on_abandon)
 
 
+@dataclass
+class OutboundRequest:
+    """An outgoing request, as seen by an `OutboundRequestHook` just before it is written."""
+
+    method: str
+    params: Mapping[str, Any]
+    """The request params as they will be sent, without `_meta` (see `meta`). Read-only view."""
+    meta: dict[str, Any]
+    """The `_meta` that will be sent, already holding the W3C trace context. Hooks may add keys."""
+
+
+OutboundRequestHook = Callable[[OutboundRequest], None]
+"""Called once per outgoing request, inside the `MCP send ...` span and before the request is written."""
+
+
 class JSONRPCDispatcher(Dispatcher[TransportT]):
     """`Dispatcher` over the `SessionMessage` stream contract.
 
@@ -277,6 +293,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         raise_handler_exceptions: bool = False,
         inline_methods: frozenset[str] = frozenset(),
         on_stream_exception: Callable[[Exception], Awaitable[None]] | None = None,
+        outbound_hooks: Sequence[OutboundRequestHook] = (),
     ) -> None:
         """Wire a dispatcher over a transport's `SessionMessage` stream pair.
 
@@ -291,6 +308,12 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             on_stream_exception: Observer for `Exception` items on the read
                 stream; without it they are debug-logged and dropped. Awaited
                 inline in the read loop, so a slow observer stalls dispatch.
+            outbound_hooks: Called in order for every outgoing request, inside
+                the request's OpenTelemetry span (so they see the same span
+                context that goes on the wire) and after the trace context was
+                injected, before the request is written. Synchronous and run
+                inline: they must be fast, and an exception raised by a hook
+                fails that request before anything is sent.
         """
         self._read_stream = read_stream
         self._write_stream = write_stream
@@ -303,6 +326,7 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         self._peer_cancel_mode: PeerCancelMode = peer_cancel_mode
         self._raise_handler_exceptions = raise_handler_exceptions
         self._inline_methods = inline_methods
+        self._outbound_hooks = tuple(outbound_hooks)
         self.on_stream_exception = on_stream_exception
         """Observer for ``Exception`` items on the read stream. Mutable so a session can
         bind it after the dispatcher is built (e.g. ``ClientSession`` routing into
@@ -391,6 +415,11 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
             ) as span:
                 # SEP-414: inject W3C trace context.
                 inject_trace_context(out_meta)
+                if self._outbound_hooks:
+                    visible = {k: v for k, v in out_params.items() if k != "_meta"}
+                    outbound = OutboundRequest(method, MappingProxyType(visible), out_meta)
+                    for hook in self._outbound_hooks:
+                        hook(outbound)
                 if out_meta:
                     out_params["_meta"] = out_meta
                 else:

@@ -10,6 +10,7 @@ from typing import Any
 import anyio
 import anyio.lowlevel
 import pytest
+from logfire.testing import CaptureLogfire
 from mcp_types import (
     CONNECTION_CLOSED,
     INTERNAL_ERROR,
@@ -29,6 +30,7 @@ from mcp_types import (
     RequestId,
     Tool,
 )
+from opentelemetry.trace import get_current_span
 from trio.testing import MockClock
 
 from mcp import Client
@@ -39,6 +41,8 @@ from mcp.shared.dispatcher import CallOptions, DispatchContext, OnRequest, coerc
 from mcp.shared.exceptions import MCPError, NoBackChannelError
 from mcp.shared.jsonrpc_dispatcher import (  # pyright: ignore[reportPrivateUsage]
     JSONRPCDispatcher,
+    OutboundRequest,
+    OutboundRequestHook,
     PeerCancelMode,
     _OutboundPlan,
     _Pending,
@@ -47,7 +51,7 @@ from mcp.shared.jsonrpc_dispatcher import (  # pyright: ignore[reportPrivateUsag
 from mcp.shared.message import ClientMessageMetadata, MessageMetadata, ServerMessageMetadata, SessionMessage
 from mcp.shared.transport_context import TransportContext
 
-from .conftest import jsonrpc_pair
+from .conftest import DispatcherTriple, PairFactory, jsonrpc_pair
 from .test_dispatcher import Recorder, echo_handlers, running_pair
 
 DCtx = DispatchContext[TransportContext]
@@ -2529,3 +2533,91 @@ async def test_send_raw_request_with_caller_supplied_string_id_is_verbatim_on_th
         for stream in (c2s_send, c2s_recv, s2c_send, s2c_recv):
             stream.close()
     assert result_box == [{"ok": True}]
+
+
+def hooked_pair(*hooks: OutboundRequestHook) -> PairFactory:
+    """A `jsonrpc_pair` whose client side runs `hooks` on every outgoing request."""
+
+    def factory(*, can_send_request: bool = True) -> DispatcherTriple:
+        c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
+        s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](32)
+
+        def builder(_meta: object) -> TransportContext:
+            return TransportContext(kind="jsonrpc", can_send_request=can_send_request)
+
+        client: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(
+            s2c_recv, c2s_send, transport_builder=builder, outbound_hooks=hooks
+        )
+        server: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send, transport_builder=builder)
+
+        def close() -> None:
+            for stream in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+                stream.close()
+
+        return client, server, close
+
+    return factory
+
+
+@pytest.mark.anyio
+async def test_outbound_hook_sees_the_request_and_its_added_meta_reaches_the_peer():
+    """SDK-defined: a hook receives method, params (without `_meta`) and a mutable `_meta` before the write."""
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    def hook(request: OutboundRequest) -> None:
+        seen.append((request.method, dict(request.params)))
+        request.meta["correlation"] = "c-1"
+
+    async def server_on_request(ctx: DCtx, method: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        assert params is not None
+        return {"meta": params["_meta"]}
+
+    async with running_pair(hooked_pair(hook), server_on_request=server_on_request) as (client, *_):
+        with anyio.fail_after(5):
+            result = await client.send_raw_request("tools/call", {"name": "add", "arguments": {"a": 1}})
+
+    assert seen == [("tools/call", {"name": "add", "arguments": {"a": 1}})]
+    assert result["meta"]["correlation"] == "c-1"
+
+
+@pytest.mark.anyio
+async def test_outbound_hook_runs_inside_the_request_span_whose_trace_context_goes_on_the_wire(
+    capfire: CaptureLogfire,
+):
+    """SDK-defined: the hook runs inside `MCP send ...`, so it sees the span id carried by the sent traceparent."""
+    in_hook: list[tuple[str, int]] = []
+
+    def hook(request: OutboundRequest) -> None:
+        span_context = get_current_span().get_span_context()
+        in_hook.append((request.meta["traceparent"], span_context.span_id))
+
+    async with running_pair(hooked_pair(hook)) as (client, *_):
+        with anyio.fail_after(5):
+            await client.send_raw_request("tools/call", {"name": "add"})
+
+    [(traceparent, hook_span_id)] = in_hook
+    assert traceparent.split("-")[2] == format(hook_span_id, "016x")
+    span = next(s for s in capfire.exporter.exported_spans_as_dict() if s["name"] == "MCP send tools/call add")
+    assert span["context"]["span_id"] == hook_span_id
+
+
+@pytest.mark.anyio
+async def test_outbound_hook_exception_fails_the_request_before_it_is_sent():
+    """SDK-defined: a raising hook propagates to the caller, nothing is written, and the dispatcher keeps working."""
+    calls = 0
+
+    def hook(request: OutboundRequest) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("refused locally")
+
+    async with running_pair(hooked_pair(hook)) as (client, _server, _client_rec, server_rec):
+        with anyio.fail_after(5):
+            with pytest.raises(RuntimeError, match="refused locally"):
+                await client.send_raw_request("tools/call", {"name": "add"})
+            assert server_rec.requests == []
+            result = await client.send_raw_request("tools/call", {"name": "add"})
+
+    assert result["echoed"] == "tools/call"
+    assert server_rec.requests == [("tools/call", {"name": "add"})]

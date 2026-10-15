@@ -125,6 +125,16 @@ don't think about it. It is a no-op until you install an exporter, and it has it
     the decoded message instead of the raw HTTP request. The two compose: Starlette middleware
     on `streamable_http_app()` sees HTTP; this sees MCP.
 
+## Outbound client requests
+
+Middleware wraps what a **server** receives. To observe what a **client** sends, give the `JSONRPCDispatcher` an
+`outbound_hooks` list and pass the dispatcher to `ClientSession(dispatcher=...)`. Each hook is a plain function that gets
+an `OutboundRequest` (`method`, read-only `params`, and a mutable `meta`) once per request. It runs inside the
+`MCP send ...` span, after the trace context is injected into `meta` and before the request is written, so it sees the
+same span that goes on the wire. Raise to refuse the request before anything is sent.
+
+This is provisional too, like the server list.
+
 ## Recap
 
 * A middleware is `async (ctx, call_next) -> result`, passed as `MCPServer(middleware=[...])` (or
